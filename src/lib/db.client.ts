@@ -787,9 +787,21 @@ export async function savePlayRecord(
         body: JSON.stringify({ key, record }),
       });
     } catch (err) {
-      await handleDatabaseOperationFailure('playRecords', err);
-      triggerGlobalError('保存播放记录失败');
-      throw err;
+      // 播放记录以用户体验为优先：保留已经写入的本地缓存，避免切集后记忆进度被回滚。
+      console.warn('同步播放记录到数据库失败，保留本地缓存:', err);
+
+      // 后台再尝试补一次，不打断当前播放流程。
+      window.setTimeout(() => {
+        fetchWithAuth('/api/playrecords', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({ key, record }),
+        }).catch((retryErr) => {
+          console.warn('播放记录后台重试失败:', retryErr);
+        });
+      }, 3000);
     }
     return;
   }
@@ -2244,5 +2256,4 @@ export async function saveEpisodeFilterConfig(
     throw err;
   }
 }
-
 

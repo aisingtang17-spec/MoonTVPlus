@@ -672,10 +672,9 @@ function PlayPageClient() {
       }
     }
 
-    // 如果不是首次检查，标记为已关闭，不再显示跳转按钮
-    if (!playRecordJumpInitialCheckRef.current) {
-      playRecordJumpDismissedRef.current = true;
-    }
+    // 切到新的一集后，重新允许检查该集是否存在播放记录。
+    playRecordJumpInitialCheckRef.current = true;
+    playRecordJumpDismissedRef.current = false;
   }, [currentEpisodeIndex]);
 
   // 监听 URL 参数变化，当切换到不同视频时重新加载页面
@@ -1534,6 +1533,94 @@ function PlayPageClient() {
     ? directEpisodeLabel
     : `第${currentEpisodeIndex + 1}集`;
 
+  const loadSavedPlaybackRate = () => {
+    if (typeof window === 'undefined') {
+      return 1.0;
+    }
+
+    const raw = localStorage.getItem('preferredPlaybackRate');
+    const parsed = raw ? Number(raw) : 1;
+    return Number.isFinite(parsed) && parsed > 0 ? parsed : 1.0;
+  };
+
+  const persistPlaybackRate = (rate: number) => {
+    if (typeof window === 'undefined' || !Number.isFinite(rate) || rate <= 0) {
+      return;
+    }
+
+    localStorage.setItem('preferredPlaybackRate', String(rate));
+  };
+
+  const isDanmakuAutoLoadDisabled = () => {
+    if (typeof window === 'undefined') {
+      return false;
+    }
+
+    const saved = localStorage.getItem('disableAutoLoadDanmaku');
+    if (saved !== null) {
+      return saved === 'true';
+    }
+
+    return (window as any).RUNTIME_CONFIG?.DANMAKU_AUTO_LOAD_DEFAULT === false;
+  };
+
+  const getEpisodeProgressStorageKey = (
+    source: string,
+    id: string,
+    episodeIndex: number
+  ) => `moontv_episode_progress:${source}+${id}:${episodeIndex}`;
+
+  const loadLocalEpisodeProgress = (
+    source: string,
+    id: string,
+    episodeIndex: number
+  ): number | null => {
+    if (typeof window === 'undefined') {
+      return null;
+    }
+
+    try {
+      const raw = localStorage.getItem(
+        getEpisodeProgressStorageKey(source, id, episodeIndex)
+      );
+      if (!raw) {
+        return null;
+      }
+
+      const parsed = JSON.parse(raw) as { playTime?: number };
+      const playTime = Number(parsed.playTime);
+      return Number.isFinite(playTime) && playTime > 1 ? playTime : null;
+    } catch (error) {
+      console.warn('[Play] Failed to load local episode progress:', error);
+      return null;
+    }
+  };
+
+  const saveLocalEpisodeProgress = (
+    source: string,
+    id: string,
+    episodeIndex: number,
+    playTime: number,
+    totalTime: number
+  ) => {
+    if (typeof window === 'undefined' || !Number.isFinite(playTime) || playTime <= 0) {
+      return;
+    }
+
+    try {
+      localStorage.setItem(
+        getEpisodeProgressStorageKey(source, id, episodeIndex),
+        JSON.stringify({
+          playTime: Math.floor(playTime),
+          totalTime: Math.floor(totalTime),
+          updatedAt: Date.now(),
+        })
+      );
+    } catch (error) {
+      console.warn('[Play] Failed to save local episode progress:', error);
+    }
+  };
+
   // 用于记录是否需要在播放器 ready 后跳转到指定进度
   const resumeTimeRef = useRef<number | null>(null);
   // 播放记录跳转按钮状态
@@ -1543,7 +1630,9 @@ function PlayPageClient() {
   // 上次使用的音量，默认 0.7
   const lastVolumeRef = useRef<number>(0.7);
   // 上次使用的播放速率，默认 1.0
-  const lastPlaybackRateRef = useRef<number>(1.0);
+  const lastPlaybackRateRef = useRef<number>(loadSavedPlaybackRate());
+  // Safari 切集时会短暂把 playbackRate 重置为 1，这里保留一段恢复窗口避免污染记忆值
+  const playbackRateRestoreWindowUntilRef = useRef<number>(0);
 
   // 换源相关状态
   const [availableSources, setAvailableSources] = useState<SearchResult[]>([]);
@@ -2665,13 +2754,25 @@ function PlayPageClient() {
   const ensureVideoSource = (video: HTMLVideoElement | null, url: string) => {
     if (!video || !url) return;
     const sources = Array.from(video.getElementsByTagName('source'));
-    const existed = sources.some((s) => s.src === url);
-    if (!existed) {
-      // 移除旧的 source，保持唯一
+    const isHlsLikeSource =
+      !!(video as any).hls ||
+      /\.m3u8?($|\?)/i.test(url) ||
+      url.includes('/api/proxy-m3u8') ||
+      url.includes('/api/proxy/vod/m3u8');
+
+    if (isHlsLikeSource) {
+      // HLS 由 hls.js 接管时，不能再给 <video> 塞原始 m3u8 source，
+      // 否则 Safari 可能切回原生 HLS，和 MSE/hls.js 抢同一个播放器。
       sources.forEach((s) => s.remove());
-      const sourceEl = document.createElement('source');
-      sourceEl.src = url;
-      video.appendChild(sourceEl);
+    } else {
+      const existed = sources.some((s) => s.src === url);
+      if (!existed) {
+        // 移除旧的 source，保持唯一
+        sources.forEach((s) => s.remove());
+        const sourceEl = document.createElement('source');
+        sourceEl.src = url;
+        video.appendChild(sourceEl);
+      }
     }
 
     // 始终允许远程播放（AirPlay / Cast）
@@ -3856,6 +3957,12 @@ function PlayPageClient() {
             } else {
               // 否则使用点击的文件集数，从头开始播放
               initialIndex = detailData.initialEpisodeIndex;
+              const localEpisodeTime = loadLocalEpisodeProgress(
+                detailData.source,
+                detailData.id,
+                initialIndex
+              );
+              resumeTimeRef.current = localEpisodeTime;
               console.log('[Play] 使用点击的文件集数:', initialIndex);
             }
           } else {
@@ -3870,10 +3977,20 @@ function PlayPageClient() {
           if (detailData.initialEpisodeIndex !== undefined) {
             // 使用点击的文件集数
             initialIndex = detailData.initialEpisodeIndex;
+            resumeTimeRef.current = loadLocalEpisodeProgress(
+              detailData.source,
+              detailData.id,
+              initialIndex
+            );
             console.log('[Play] 没有播放记录，使用点击的文件集数:', initialIndex);
           } else {
             // 默认从第0集开始
             initialIndex = 0;
+            resumeTimeRef.current = loadLocalEpisodeProgress(
+              detailData.source,
+              detailData.id,
+              initialIndex
+            );
             console.log('[Play] 没有播放记录，从第0集开始');
           }
         }
@@ -4196,31 +4313,73 @@ function PlayPageClient() {
   // ---------------------------------------------------------------------------
   // 集数切换
   // ---------------------------------------------------------------------------
-  // 处理集数切换
-  const handleEpisodeChange = (episodeNumber: number) => {
-    if (episodeNumber >= 0 && episodeNumber < totalEpisodes) {
-      // 在更换集数前保存当前播放进度
-      if (artPlayerRef.current && artPlayerRef.current.paused) {
-        saveCurrentPlayProgress();
+  const primeEpisodeResumeState = async (targetEpisodeIndex: number) => {
+    if (!currentSourceRef.current || !currentIdRef.current) {
+      resumeTimeRef.current = null;
+      return;
+    }
+
+    try {
+      const allRecords = await getAllPlayRecords();
+      const key = generateStorageKey(currentSourceRef.current, currentIdRef.current);
+      const record = allRecords[key];
+
+      if (record && record.index - 1 === targetEpisodeIndex && record.play_time > 1) {
+        resumeTimeRef.current = record.play_time;
+      } else {
+        resumeTimeRef.current = loadLocalEpisodeProgress(
+          currentSourceRef.current,
+          currentIdRef.current,
+          targetEpisodeIndex
+        );
       }
-      setVideoLoadingStage('episodeChanging');
-      setIsVideoLoading(true);
-      setVideoError(null);
+    } catch (error) {
+      console.warn('[Play] Failed to prime episode resume state:', error);
+      if (currentSourceRef.current && currentIdRef.current) {
+        resumeTimeRef.current = loadLocalEpisodeProgress(
+          currentSourceRef.current,
+          currentIdRef.current,
+          targetEpisodeIndex
+        );
+      } else {
+        resumeTimeRef.current = null;
+      }
+    }
+  };
+
+  const prepareEpisodeSwitch = async () => {
+    if (artPlayerRef.current) {
+      lastPlaybackRateRef.current =
+        artPlayerRef.current.playbackRate || lastPlaybackRateRef.current;
+      lastVolumeRef.current =
+        artPlayerRef.current.volume || lastVolumeRef.current;
+      playbackRateRestoreWindowUntilRef.current = Date.now() + 8000;
+
+      await saveCurrentPlayProgress();
+    }
+
+    setVideoLoadingStage('episodeChanging');
+    setIsVideoLoading(true);
+    setVideoError(null);
+  };
+
+  // 处理集数切换
+  const handleEpisodeChange = async (episodeNumber: number) => {
+    if (episodeNumber >= 0 && episodeNumber < totalEpisodes) {
+      await prepareEpisodeSwitch();
+      await primeEpisodeResumeState(episodeNumber);
       setCurrentEpisodeIndex(episodeNumber);
     }
   };
 
-  const handlePreviousEpisode = () => {
+  const handlePreviousEpisode = async () => {
     const d = detailRef.current;
     const idx = currentEpisodeIndexRef.current;
     if (d && d.episodes && idx > 0) {
-      if (artPlayerRef.current && !artPlayerRef.current.paused) {
-        saveCurrentPlayProgress();
-      }
-      setVideoLoadingStage('episodeChanging');
-      setIsVideoLoading(true);
-      setVideoError(null);
-      setCurrentEpisodeIndex(idx - 1);
+      await prepareEpisodeSwitch();
+      const targetIndex = idx - 1;
+      await primeEpisodeResumeState(targetIndex);
+      setCurrentEpisodeIndex(targetIndex);
     }
   };
 
@@ -4248,17 +4407,12 @@ function PlayPageClient() {
     return false;
   };
 
-  const handleNextEpisode = () => {
+  const handleNextEpisode = async () => {
     const d = detailRef.current;
     const idx = currentEpisodeIndexRef.current;
 
     if (!d || !d.episodes || idx >= d.episodes.length - 1) {
       return;
-    }
-
-    // 保存当前进度
-    if (artPlayerRef.current && !artPlayerRef.current.paused) {
-      saveCurrentPlayProgress();
     }
 
     // 查找下一个未被过滤的集数
@@ -4268,9 +4422,8 @@ function PlayPageClient() {
       const isFiltered = episodeTitle && isEpisodeFilteredByTitle(episodeTitle);
 
       if (!isFiltered) {
-        setVideoLoadingStage('episodeChanging');
-        setIsVideoLoading(true);
-        setVideoError(null);
+        await prepareEpisodeSwitch();
+        await primeEpisodeResumeState(nextIdx);
         setCurrentEpisodeIndex(nextIdx);
         return;
       }
@@ -4908,7 +5061,7 @@ function PlayPageClient() {
   // 自动搜索并加载弹幕
   const autoSearchDanmaku = async () => {
     if (isDirectPlay) return;
-    const disableAutoLoad = localStorage.getItem('disableAutoLoadDanmaku') === 'true';
+    const disableAutoLoad = isDanmakuAutoLoadDisabled();
     if (disableAutoLoad) return;
 
     const title = videoTitleRef.current;
@@ -5238,6 +5391,14 @@ function PlayPageClient() {
     }
 
     try {
+      saveLocalEpisodeProgress(
+        currentSourceRef.current,
+        currentIdRef.current,
+        currentEpisodeIndexRef.current,
+        currentTime,
+        duration
+      );
+
       await savePlayRecord(currentSourceRef.current, currentIdRef.current, {
         title: videoTitleRef.current,
         source_name: detailRef.current?.source_name || '',
@@ -5548,11 +5709,77 @@ function PlayPageClient() {
         const Hls = HlsModule.default;
         const artplayerPluginDanmuku = DanmukuPlugin.default as any;
 
+        const syncPlaybackPitch = () => {
+          if (!isWebkit || !artPlayerRef.current?.video) {
+            return;
+          }
+
+          const video = artPlayerRef.current.video as HTMLVideoElement & {
+            webkitPreservesPitch?: boolean;
+          };
+          const playbackRate = artPlayerRef.current.playbackRate || 1;
+          const shouldPreservePitch = playbackRate <= 2;
+
+          if ('preservesPitch' in video) {
+            video.preservesPitch = shouldPreservePitch;
+          }
+          if ('webkitPreservesPitch' in video) {
+            video.webkitPreservesPitch = shouldPreservePitch;
+          }
+        };
+
+        const rescueWebkitHlsBootstrap = (
+          reason: string,
+          retryDelays: number[] = [1500, 3500, 6000]
+        ) => {
+          if (!isWebkit || !artPlayerRef.current?.video) {
+            return;
+          }
+
+          const video = artPlayerRef.current.video as HTMLVideoElement & {
+            hls?: {
+              detachMedia?: () => void;
+              attachMedia?: (video: HTMLVideoElement) => void;
+              startLoad?: (startPosition?: number) => void;
+            };
+          };
+
+          retryDelays.forEach((delay) => {
+            window.setTimeout(() => {
+              if (!artPlayerRef.current || artPlayerRef.current.video !== video) {
+                return;
+              }
+
+              const hls = video.hls;
+              const currentSrc = video.currentSrc || video.src || '';
+
+              if (!hls || currentSrc || video.readyState > 0) {
+                return;
+              }
+
+              console.warn(
+                `[HLS] Safari bootstrap rescue triggered (${reason}, ${delay}ms)`
+              );
+
+              try {
+                hls.detachMedia?.();
+                hls.attachMedia?.(video);
+                hls.startLoad?.(-1);
+                video.play().catch((error) => {
+                  console.warn('[HLS] Safari rescue play failed:', error);
+                });
+              } catch (error) {
+                console.warn('[HLS] Safari bootstrap rescue failed:', error);
+              }
+            }, delay);
+          });
+        };
+
         // 创建自定义 HLS loader
         const CustomHlsJsLoader = createCustomHlsLoader(Hls);
 
         // 创建新的播放器实例
-        Artplayer.PLAYBACK_RATE = [0.5, 0.75, 1, 1.25, 1.5, 2, 3];
+        Artplayer.PLAYBACK_RATE = [0.5, 0.75, 1, 1.25, 1.5, 2, 3, 4];
         Artplayer.USE_RAF = true;
 
         // 获取当前集的字幕
@@ -5685,7 +5912,9 @@ function PlayPageClient() {
               const hls = new Hls({
                 debug: false, // 关闭日志
                 enableWorker: true, // WebWorker 解码，降低主线程压力
-                lowLatencyMode: true, // 开启低延迟 LL-HLS
+                // 点播播放不需要 LL-HLS，小缓冲在 Safari 高倍速下更容易抖动。
+                lowLatencyMode: false,
+                autoStartLoad: true,
 
                 /* 缓冲/内存相关 - 根据用户设置的缓冲策略动态调整 */
                 maxBufferLength: bufferConfig.maxBufferLength, // 前向缓冲长度
@@ -5696,9 +5925,69 @@ function PlayPageClient() {
                 loader: loaderClass as any,
               });
 
+              const kickStartHlsPlayback = () => {
+                try {
+                  hls.startLoad(-1);
+                } catch (error) {
+                  console.warn('[HLS] startLoad failed:', error);
+                }
+
+                if (!video.paused) {
+                  video.play().catch((error) => {
+                    console.warn('[HLS] play after attach failed:', error);
+                  });
+                }
+              };
+
+              hls.on(Hls.Events.MEDIA_ATTACHED, () => {
+                kickStartHlsPlayback();
+              });
+
+              hls.on(Hls.Events.MEDIA_ATTACHED, () => {
+                if (!isWebkit) {
+                  return;
+                }
+
+                // Safari 偶发出现 media 已 attach 但 video.src 仍为空的状态。
+                // 这里延迟自检一次，必要时重新 attach，强制进入 blob: MSE 路径。
+                window.setTimeout(() => {
+                  const currentSrc = video.currentSrc || video.src || '';
+                  if (currentSrc) {
+                    return;
+                  }
+
+                  console.warn('[HLS] Safari attach watchdog triggered, reattaching media');
+                  try {
+                    hls.detachMedia();
+                    hls.attachMedia(video);
+                    kickStartHlsPlayback();
+                  } catch (error) {
+                    console.warn('[HLS] Safari reattach failed:', error);
+                  }
+                }, 1200);
+              });
+
               hls.loadSource(url);
               hls.attachMedia(video);
               video.hls = hls;
+
+              if (isWebkit) {
+                window.setTimeout(() => {
+                  const currentSrc = video.currentSrc || video.src || '';
+                  if (currentSrc) {
+                    return;
+                  }
+
+                  console.warn('[HLS] Safari post-attach watchdog triggered, forcing reattach');
+                  try {
+                    hls.detachMedia();
+                    hls.attachMedia(video);
+                    kickStartHlsPlayback();
+                  } catch (error) {
+                    console.warn('[HLS] Safari post-attach reattach failed:', error);
+                  }
+                }, 1200);
+              }
 
               ensureVideoSource(video, url);
 
@@ -5711,6 +6000,12 @@ function PlayPageClient() {
               // 监听Manifest加载完成事件，启动xiaoya链接定时刷新
               hls.on(Hls.Events.MANIFEST_PARSED, () => {
                 console.log('[HLS] Manifest解析完成');
+
+                if (video.paused && (artPlayerRef.current?.option.autoplay || artPlayerRef.current?.loading)) {
+                  video.play().catch((error) => {
+                    console.warn('[HLS] play after manifest parsed failed:', error);
+                  });
+                }
 
                 // 只在首次加载时启动定时器（后续刷新会在refreshXiaoyaUrl中启动）
                 if (isInitialLoadRef.current && currentXiaoyaUrlRef.current && url.includes('.m3u8')) {
@@ -6552,6 +6847,8 @@ function PlayPageClient() {
         artPlayerRef.current.on('ready', async () => {
           setError(null);
 
+          rescueWebkitHlsBootstrap('player-ready');
+
           // 标记播放器已就绪，触发 usePlaySync 设置事件监听器
           setPlayerReady(true);
           console.log('[PlayPage] Player ready, triggering sync setup');
@@ -6886,7 +7183,43 @@ function PlayPageClient() {
           lastVolumeRef.current = artPlayerRef.current.volume;
         });
         artPlayerRef.current.on('video:ratechange', () => {
-          lastPlaybackRateRef.current = artPlayerRef.current.playbackRate;
+          const currentRate = artPlayerRef.current.playbackRate;
+          const shouldIgnoreSafariReset =
+            isWebkit &&
+            Date.now() < playbackRateRestoreWindowUntilRef.current &&
+            Math.abs(currentRate - 1) < 0.01 &&
+            lastPlaybackRateRef.current > 1;
+
+          if (shouldIgnoreSafariReset) {
+            // Safari 切集后可能偷偷回到 1x，这不是用户真实选择，不要覆盖记忆值。
+            setTimeout(() => {
+              if (
+                artPlayerRef.current &&
+                Math.abs(
+                  artPlayerRef.current.playbackRate - lastPlaybackRateRef.current
+                ) > 0.01
+              ) {
+                artPlayerRef.current.playbackRate = lastPlaybackRateRef.current;
+              }
+            }, 0);
+            syncPlaybackPitch();
+            return;
+          }
+
+          lastPlaybackRateRef.current = currentRate;
+          persistPlaybackRate(currentRate);
+          syncPlaybackPitch();
+        });
+        artPlayerRef.current.on('video:playing', () => {
+          if (
+            isWebkit &&
+            Date.now() < playbackRateRestoreWindowUntilRef.current &&
+            Math.abs(
+              artPlayerRef.current.playbackRate - lastPlaybackRateRef.current
+            ) > 0.01
+          ) {
+            artPlayerRef.current.playbackRate = lastPlaybackRateRef.current;
+          }
         });
 
         // 监听网页全屏事件，控制导航栏显示隐藏
@@ -7380,6 +7713,8 @@ function PlayPageClient() {
 
         // 监听视频可播放事件，这时恢复播放进度更可靠
         artPlayerRef.current.on('video:canplay', () => {
+          let restoredResumeTime = false;
+
           // 若存在需要恢复的播放进度，则跳转
           if (resumeTimeRef.current && resumeTimeRef.current > 0) {
             try {
@@ -7389,6 +7724,7 @@ function PlayPageClient() {
                 target = Math.max(0, duration - 5);
               }
               artPlayerRef.current.currentTime = target;
+              restoredResumeTime = true;
               console.log('成功恢复播放进度到:', resumeTimeRef.current);
             } catch (err) {
               console.warn('恢复播放进度失败:', err);
@@ -7397,19 +7733,53 @@ function PlayPageClient() {
           resumeTimeRef.current = null;
 
           setTimeout(() => {
+            const restorePlaybackRate = () => {
+              if (
+                Math.abs(
+                  artPlayerRef.current.playbackRate - lastPlaybackRateRef.current
+                ) > 0.01 &&
+                isWebkit
+              ) {
+                artPlayerRef.current.playbackRate = lastPlaybackRateRef.current;
+              }
+            };
+
             if (
               Math.abs(artPlayerRef.current.volume - lastVolumeRef.current) > 0.01
             ) {
               artPlayerRef.current.volume = lastVolumeRef.current;
             }
-            if (
-              Math.abs(
-                artPlayerRef.current.playbackRate - lastPlaybackRateRef.current
-              ) > 0.01 &&
-              isWebkit
-            ) {
-              artPlayerRef.current.playbackRate = lastPlaybackRateRef.current;
+
+            // Safari 在 seek 刚发生时立刻恢复 3x，容易卡进持续 seeking 状态。
+            // 这里等 seek 稳定后再恢复倍速，避免恢复进度和变速互相打架。
+            if (restoredResumeTime && isWebkit && artPlayerRef.current?.video) {
+              const video = artPlayerRef.current.video as HTMLVideoElement;
+              const applyRateAfterSeek = () => {
+                restorePlaybackRate();
+              };
+
+              if (video.seeking) {
+                const handleSeeked = () => {
+                  window.clearTimeout(seekedTimeout);
+                  applyRateAfterSeek();
+                };
+                const seekedTimeout = window.setTimeout(() => {
+                  video.removeEventListener('seeked', handleSeeked);
+                  applyRateAfterSeek();
+                }, 300);
+
+                video.addEventListener(
+                  'seeked',
+                  handleSeeked,
+                  { once: true }
+                );
+              } else {
+                restorePlaybackRate();
+              }
+            } else {
+              restorePlaybackRate();
             }
+            syncPlaybackPitch();
             artPlayerRef.current.notice.show = '';
           }, 0);
 
